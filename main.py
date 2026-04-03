@@ -90,6 +90,7 @@ class SecurityBot:
         self.spam_tracker = {}  # Rastreamento de spam
         self.backup_data = {}  # Backups de canais/cargos
         self.ban_tracker = {}  # Rastreamento de banimentos por usuário/bot
+        self.bot_ban_history = {}  # Histórico de bans realizados pelo BOT (safe mode)
         self.bot_activity_logs = {}  # Logs de atividade de bots
         self.category_messages = {}  # Mensagens salvas por canal (Categoria 1451797806259114080)
         self.ping_cooldowns = {}  # Cooldown para alertas de mass ping/everyone
@@ -212,14 +213,12 @@ class SecurityBot:
         if user_or_bot.id in config.get('whitelist_users', []):
             return
 
-        # BANIMENTO IMEDIATO NA PRIMEIRA TENTATIVA SUSPEITA
-        try:
-            reason = "🔒 Segurança: Banimento não autorizado detectado (Proteção Anti-Raid)"
-            await user_or_bot.ban(reason=reason)
-            
-            bot_type = "🤖 BOT" if user_or_bot.bot else "👤 USUÁRIO"
-            
-            # Mensagens de deboche aleatórias
+        # BANIMENTO VIA MÉTODO SAFE NA PRIMEIRA TENTATIVA SUSPEITA
+        bot_type = "🤖 BOT" if user_or_bot.bot else "👤 USUÁRIO"
+        reason = "🔒 Segurança: Banimento não autorizado detectado (Proteção Anti-Raid)"
+        banned, ban_count = await self.safe_ban(guild, user_or_bot, reason)
+
+        if banned:
             mockery_messages = [
                 "Tentativa de invasão detectada e neutralizada.",
                 "O sistema de segurança identificou e removeu o infrator.",
@@ -237,11 +236,56 @@ class SecurityBot:
                 COLORS['danger'],
                 [
                     {'name': '🎯 Alvo', 'value': f"{target} ({target.id})", 'inline': True},
-                    {'name': '⚡ Ação', 'value': "Banimento Automático", 'inline': True}
+                    {'name': '⚡ Ação', 'value': f"Banimento Automático (safe {ban_count}/2)", 'inline': True}
                 ]
             )
+
+    async def safe_ban(self, guild, member, reason: str = "🔒 Segurança"):
+        """Rastreia bans por executor. Avisa na 1ª vez (1/2), bane na 2ª (2/2) em 10 minutos."""
+        guild_id_str = str(guild.id)
+        executor_id_str = str(member.id)
+        now = datetime.utcnow()
+        window = timedelta(minutes=10)
+        max_bans = 2
+
+        if guild_id_str not in self.bot_ban_history:
+            self.bot_ban_history[guild_id_str] = {}
+
+        if executor_id_str not in self.bot_ban_history[guild_id_str]:
+            self.bot_ban_history[guild_id_str][executor_id_str] = []
+
+        self.bot_ban_history[guild_id_str][executor_id_str] = [
+            t for t in self.bot_ban_history[guild_id_str][executor_id_str]
+            if now - datetime.fromisoformat(t) < window
+        ]
+
+        count = len(self.bot_ban_history[guild_id_str][executor_id_str])
+        self.bot_ban_history[guild_id_str][executor_id_str].append(now.isoformat())
+        new_count = count + 1
+
+        if new_count < max_bans:
+            # 1ª ocorrência: apenas avisa, não bane
+            await self.log_security_action(
+                guild,
+                "⚠️ Aviso - Método Safe",
+                f"{member.mention} baniu um membro. Método safe de {new_count}/{max_bans} em 10 minutos.\nSe banir novamente em 10 minutos, será banido automaticamente.",
+                COLORS['warning']
+            )
+            return False, new_count
+
+        # 2ª ocorrência ou mais: bane
+        try:
+            await guild.ban(member, reason=reason)
+            await self.log_security_action(
+                guild,
+                "🔨 Ban Automático - Método Safe",
+                f"BOT baniu {member.mention}. Método safe de {new_count}/{max_bans} em 10 minutos.",
+                COLORS['danger']
+            )
+            return True, new_count
         except Exception as e:
-            print(f"Erro ao punir mass banner: {e}")
+            print(f"Erro ao banir (safe_ban): {e}")
+            return False, new_count
 
 # Instância global do sistema de segurança
 security_system = SecurityBot()
