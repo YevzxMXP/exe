@@ -267,7 +267,7 @@ class SecurityBot:
             # 1ª ocorrência: apenas avisa, não bane
             await self.log_security_action(
                 guild,
-                "⚠️ Aviso - Método Safe",
+                "Aviso - Método Safe",
                 f"{member.mention} baniu um membro. Método safe de {new_count}/{max_bans} em 10 minutos.\nSe banir novamente em 10 minutos, será banido automaticamente.",
                 COLORS['warning']
             )
@@ -278,7 +278,7 @@ class SecurityBot:
             await guild.ban(member, reason=reason)
             await self.log_security_action(
                 guild,
-                "🔨 Ban Automático - Método Safe",
+                "Ban Automático - Método Safe",
                 f"BOT baniu {member.mention}. Método safe de {new_count}/{max_bans} em 10 minutos.",
                 COLORS['danger']
             )
@@ -712,28 +712,26 @@ async def on_member_ban(guild, user):
                 # Registra o banimento no rastreador
                 await security_system.track_ban_activity(guild, executor, user)
 
-                # Log da ação de banimento
-                executor_type = "🤖 Bot" if executor.bot else "👤 Usuário"
-                target_type = "🤖 Bot" if user.bot else "👤 Usuário"
-                
-                # Se for o owner, apenas ignora
+                # Se for o owner ou whitelist, apenas ignora
                 if executor.id == OWNER_ID:
                     return
                 elif executor.id in config.get('whitelist_users', []):
                     return
-                else:
-                    # Log normal de banimento
-                    await security_system.log_security_action(
-                        guild,
-                        f"🔨 Banimento Detectado",
-                        f"⚠️ {executor_type} {executor.mention} baniu {target_type} {user.mention}",
-                        COLORS['warning'] if executor.bot else COLORS['info'],
-                        [
-                            {'name': '🎯 Executor', 'value': f"{executor_type} {executor.mention}", 'inline': True},
-                            {'name': '👤 Alvo', 'value': f"{target_type} {user.mention}", 'inline': True},
-                            {'name': '📝 Motivo', 'value': entry.reason or "Sem motivo especificado", 'inline': False}
-                        ]
-                    )
+
+                # Monta campos do embed de forma organizada
+                reason_text = entry.reason or "Sem motivo especificado"
+
+                await security_system.log_security_action(
+                    guild,
+                    "Banimento Registrado",
+                    f"Um membro foi banido no servidor.",
+                    COLORS['warning'] if executor.bot else COLORS['info'],
+                    [
+                        {'name': 'Executor do Ban', 'value': f"```{reason_text}```", 'inline': False},
+                        {'name': 'Bot Executor', 'value': f"{executor.mention}\n`{executor.name}`\n`ID: {executor.id}`", 'inline': True},
+                        {'name': 'Alvo', 'value': f"{user.mention}\n`{user.name}`\n`ID: {user.id}`", 'inline': True},
+                    ]
+                )
                 break
 
     except Exception as e:
@@ -983,29 +981,66 @@ async def config_security(ctx, setting: str = None, *, value: str = None):
     config = security_system.get_guild_config(ctx.guild.id)
 
     if not setting:
-        embed = discord.Embed(title="🔧 Configurações de Segurança", color=COLORS['info'])
+        def bval(v): return "true" if v else "false"
+        logs_val = f"<#{config['logs_channel_id']}>" if config['logs_channel_id'] else "não definido"
 
-        # Mostra configurações atuais
-        embed.add_field(name="🤖 auto_ban_bots", value="✅" if config['auto_ban_bots'] else "❌", inline=True)
-        embed.add_field(name="🆕 auto_ban_new_accounts", value="✅" if config['auto_ban_new_accounts'] else "❌", inline=True)
-        embed.add_field(name="📅 new_account_days", value=config['new_account_days'], inline=True)
-        embed.add_field(name="🛡️ protection_enabled", value="✅" if config['protection_enabled'] else "❌", inline=True)
-        embed.add_field(name="📢 anti_spam_enabled", value="✅" if config['anti_spam_enabled'] else "❌", inline=True)
-        embed.add_field(name="🚫 auto_kick_mass_ping", value="✅" if config['auto_kick_mass_ping'] else "❌", inline=True)
-        embed.add_field(name="🔗 auto_delete_invite_links", value="✅" if config['auto_delete_invite_links'] else "❌", inline=True)
-        embed.add_field(name="💾 backup_channels", value="✅" if config['backup_channels'] else "❌", inline=True)
-        embed.add_field(name="🔄 auto_recreate_channels", value="✅" if config['auto_recreate_channels'] else "❌", inline=True)
-        embed.add_field(name="🔄 auto_recreate_roles", value="✅" if config['auto_recreate_roles'] else "❌", inline=True)
-        embed.add_field(name="🤖 monitor_bot_activity", value="✅" if config['monitor_bot_activity'] else "❌", inline=True)
-        embed.add_field(name="🚨 auto_ban_mass_banner", value="✅" if config['auto_ban_mass_banner'] else "❌", inline=True)
-        embed.add_field(name="🛡️ bot_protection_enabled", value="✅" if config['bot_protection_enabled'] else "❌", inline=True)
-        embed.add_field(name="📊 max_bans_per_timeframe", value=config['max_bans_per_timeframe'], inline=True)
-        embed.add_field(name="⏰ ban_timeframe_minutes", value=config['ban_timeframe_minutes'], inline=True)
-        embed.add_field(name="📺 logs_channel_id", value=f"<#{config['logs_channel_id']}>" if config['logs_channel_id'] else "Não definido", inline=True)
+        embed = discord.Embed(title="Configurações de Segurança", color=COLORS['info'])
 
         embed.add_field(
-            name="💡 Exemplos de uso:",
-            value="`!sec_c monitor_bot_activity true`\n`!sec_c auto_ban_mass_banner true`\n`!sec_c bot_protection_enabled true`\n`!sec_c max_bans_per_timeframe 4`\n`!sec_c ban_timeframe_minutes 10`",
+            name="Proteção",
+            value=(
+                f"```\n"
+                f"protection_enabled\n  {bval(config['protection_enabled'])}\n\n"
+                f"auto_ban_bots\n  {bval(config['auto_ban_bots'])}\n\n"
+                f"auto_ban_new_accounts\n  {bval(config['auto_ban_new_accounts'])}\n\n"
+                f"new_account_days\n  {config['new_account_days']}\n"
+                f"```"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Anti-Spam / Ping",
+            value=(
+                f"```\n"
+                f"anti_spam_enabled\n  {bval(config['anti_spam_enabled'])}\n\n"
+                f"auto_kick_mass_ping\n  {bval(config['auto_kick_mass_ping'])}\n\n"
+                f"auto_delete_invite_links\n  {bval(config['auto_delete_invite_links'])}\n\n"
+                f"monitor_bot_activity\n  {bval(config['monitor_bot_activity'])}\n"
+                f"```"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Backup / Restauração",
+            value=(
+                f"```\n"
+                f"backup_channels\n  {bval(config['backup_channels'])}\n\n"
+                f"auto_recreate_channels\n  {bval(config['auto_recreate_channels'])}\n\n"
+                f"auto_recreate_roles\n  {bval(config['auto_recreate_roles'])}\n\n"
+                f"bot_protection_enabled\n  {bval(config['bot_protection_enabled'])}\n"
+                f"```"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Limites / Logs",
+            value=(
+                f"```\n"
+                f"auto_ban_mass_banner\n  {bval(config['auto_ban_mass_banner'])}\n\n"
+                f"max_bans_per_timeframe\n  {config['max_bans_per_timeframe']}\n\n"
+                f"ban_timeframe_minutes\n  {config['ban_timeframe_minutes']}\n\n"
+                f"logs_channel_id\n  {logs_val}\n"
+                f"```"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Uso",
+            value="`!sec_c <função> <valor>`\n\nExemplos:\n`!sec_c auto_ban_bots true`\n`!sec_c ban_timeframe_minutes 10`",
             inline=False
         )
 
@@ -2805,128 +2840,94 @@ async def security_help(ctx):
     """Central de ajuda - COMANDO PÚBLICO"""
     # Verificação se é o owner para mostrar informações especiais
     is_owner_user = ctx.author.id == OWNER_ID
-    # Embed principal com design melhorado
     embed = discord.Embed(
-        title="⚡ SISTEMA DE SEGURANÇA AVANÇADO ⚡",
-        description="```css\n🚀 Bot de segurança mais completo do Discord!\n💎 Proteção absoluta para seu servidor\n🛡️ Sistema anti-raid, anti-spam e muito mais!```",
+        title="Sistema de Segurança",
+        description="Bot de proteção anti-raid, anti-spam e moderação.",
         color=0x00ff41,
         timestamp=datetime.utcnow()
     )
-    
-    embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/123456789/123456789/security_logo.png")
+
     embed.set_author(name="Central de Comandos", icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
 
-    # Comandos básicos com emojis melhorados
-    basic_commands = [
-        "🔧 `!sec_c` ➜ Configurações do sistema",
-        "🔐 `!sec_w` ➜ Gerenciar whitelist", 
-        "🔄 `!sec_r` ➜ Restaurar cargos removidos",
-        "📊 `!sec_s` ➜ Status completo do sistema",
-        "📋 `!sec_l` ➜ Visualizar logs de segurança",
-        "💾 `!sec_b` ➜ Ver backups disponíveis"
-    ]
-
-    # Comandos de moderação
-    moderation_commands = [
-        "🔨 `!sec_banir @user motivo` ➜ Banir usuário",
-        "👢 `!sec_expulsar @user motivo` ➜ Expulsar usuário", 
-        "🔇 `!sec_m @user tempo motivo` ➜ Mutar usuário",
-        "🔊 `!sec_desmutar @user` ➜ Desmutar usuário",
-        "⚠️ `!sec_av @user motivo` ➜ Aplicar aviso",
-        "📝 `!sec_avisos @user` ➜ Visualizar avisos"
-    ]
-
-    # Comandos de canal
-    channel_commands = [
-        "🧹 `!sec_limpar [qtd]` ➜ Limpar mensagens",
-        "⏱️ `!sec_slowmode [seg]` ➜ Ativar modo lento",
-        "🔒 `!sec_bloquear` ➜ Bloquear canal atual",
-        "🔓 `!sec_desbloquear` ➜ Desbloquear canal",
-        "📢 `!sec_anuncio #canal msg` ➜ Fazer anúncio"
-    ]
-
-    # Comandos utilitários
-    utility_commands = [
-        "👤 `!sec_info [@user]` ➜ Informações do usuário",
-        "🖼️ `!sec_avatar [@user]` ➜ Avatar do usuário",
-        "🏰 `!sec_servidor` ➜ Informações do servidor",
-        "👥 `!sec_membros [status]` ➜ Listar membros",
-        "📺 `!sec_canais` ➜ Listar todos os canais",
-        "📋 `!sec_audit [limite]` ➜ Logs de auditoria",
-        "💾 `!sec_save` ➜ Backup completo com ID",
-        "🔄 `!sec_restore <ID>` ➜ Restaurar backup por ID",
-        "📥 `!sec_savecanais` ➜ Indexar mensagens da categoria",
-        "📊 `!sec_status_categoria` ➜ Ver mensagens salvas da categoria",
-        "🧹 `!sec_limpar_historico` ➜ Limpar histórico da categoria"
-    ]
-
-    # Comandos de cargos
-    role_commands = [
-        "🎭 `!sec_cargo add/remove @user cargo` ➜ Gerenciar cargo",
-        "✏️ `!sec_nick @user novo_nick` ➜ Alterar nickname",
-        "➕ `!sec_criar_cargo nome` ➜ Criar novo cargo",
-        "🗑️ `!sec_deletar_cargo nome` ➜ Deletar cargo",
-        "ℹ️ `!sec_cargoinfo nome` ➜ Informações do cargo"
-    ]
-
     embed.add_field(
-        name="🎮 ╔══ COMANDOS BÁSICOS ══╗",
-        value='\n'.join(basic_commands),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🛡️ ╔══ MODERAÇÃO ══╗", 
-        value='\n'.join(moderation_commands),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="📺 ╔══ GERENCIAR CANAIS ══╗",
-        value='\n'.join(channel_commands),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🔧 ╔══ UTILIDADES ══╗",
-        value='\n'.join(utility_commands),
-        inline=True
-    )
-    
-    embed.add_field(
-        name="🎭 ╔══ CARGOS ══╗",
-        value='\n'.join(role_commands),
-        inline=True
-    )
-
-    # Informações especiais
-    embed.add_field(
-        name="👑 ╔══ SUPER ADMIN ══╗",
-        value="```css\n🔥 Owner tem PODER ABSOLUTO!\n⚡ Nenhum comando afeta o owner\n🛡️ Proteção total garantida\n💎 Acesso a comandos exclusivos```",
-        inline=False
-    )
-
-    embed.add_field(
-        name="📊 ╔══ ESTATÍSTICAS ══╗",
-        value=f"```yaml\nServidores Protegidos: {len(bot.guilds)}\nUptime: Online 24/7\nProteções Ativas: Todas\nVelocidade: Ultra Rápida```",
+        name="Básicos",
+        value=(
+            "`!sec_c` — Configurações do sistema\n"
+            "`!sec_w` — Gerenciar whitelist\n"
+            "`!sec_r` — Restaurar cargos removidos\n"
+            "`!sec_s` — Status do sistema\n"
+            "`!sec_l` — Logs de segurança\n"
+            "`!sec_b` — Backups disponíveis"
+        ),
         inline=True
     )
 
     embed.add_field(
-        name="🚀 ╔══ RECURSOS ══╗",
-        value="```diff\n+ Anti-Raid Avançado\n+ Backup Automático\n+ Logs Completos\n+ Sistema de Avisos\n+ Proteção de Cargos\n+ Anti-Spam Inteligente```",
+        name="Moderação",
+        value=(
+            "`!sec_banir @user motivo`\n"
+            "`!sec_expulsar @user motivo`\n"
+            "`!sec_m @user tempo motivo`\n"
+            "`!sec_desmutar @user`\n"
+            "`!sec_av @user motivo`\n"
+            "`!sec_avisos @user`"
+        ),
         inline=True
     )
 
     embed.add_field(
-        name="⚠️ ╔══ AVISOS IMPORTANTES ══╗",
-        value="```fix\n🔴 Configure o canal de logs primeiro!\n🟡 Owner do bot é INTOCÁVEL\n🟢 Use !sec_backup_completo para backup\n🔵 Comandos staff precisam de admin```",
-        inline=False
+        name="Canais",
+        value=(
+            "`!sec_limpar [qtd]`\n"
+            "`!sec_slowmode [seg]`\n"
+            "`!sec_bloquear`\n"
+            "`!sec_desbloquear`\n"
+            "`!sec_anuncio #canal msg`"
+        ),
+        inline=True
     )
 
-    owner_status = "👑 OWNER VERIFICADO" if is_owner_user else f"❌ Não é owner (ID: {ctx.author.id})"
+    embed.add_field(
+        name="Utilidades",
+        value=(
+            "`!sec_info [@user]`\n"
+            "`!sec_avatar [@user]`\n"
+            "`!sec_servidor`\n"
+            "`!sec_membros [status]`\n"
+            "`!sec_canais`\n"
+            "`!sec_audit [limite]`\n"
+            "`!sec_save` / `!sec_restore <ID>`\n"
+            "`!sec_savecanais`\n"
+            "`!sec_status_categoria`\n"
+            "`!sec_limpar_historico`"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Cargos",
+        value=(
+            "`!sec_cargo add/remove @user cargo`\n"
+            "`!sec_nick @user novo_nick`\n"
+            "`!sec_criar_cargo nome`\n"
+            "`!sec_deletar_cargo nome`\n"
+            "`!sec_cargoinfo nome`"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Info",
+        value=(
+            f"Servidores: {len(bot.guilds)}\n"
+            f"Owner verificado: {'sim' if is_owner_user else 'não'}\n"
+            "Apenas o owner pode usar comandos."
+        ),
+        inline=True
+    )
+
     embed.set_footer(
-        text=f"⚡ Sistema desenvolvido para máxima segurança | {owner_status} ⚡",
+        text="Sistema de Segurança",
         icon_url=bot.user.avatar.url if bot.user.avatar else None
     )
 
