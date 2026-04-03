@@ -95,6 +95,8 @@ class SecurityBot:
         self.category_messages = {}  # Mensagens salvas por canal (Categoria 1451797806259114080)
         self.ping_cooldowns = {}  # Cooldown para alertas de mass ping/everyone
         self.mass_creation_cooldown = {} # Cooldown para evitar logs repetidos de criação massiva
+        self.message_cache = {}  # Cache de mensagens para detecção de ghostping
+        self.security_flags = {}  # Flags de segurança por usuário
 
     async def load_data(self):
         """Carrega dados de segurança salvos"""
@@ -330,7 +332,7 @@ async def on_ready():
     bot.loop.create_task(update_status())
 
 @bot.event
-async def on_message_monitor(message):
+async def on_message(message):
     if message.author.id == bot.user.id:
         return
 
@@ -347,11 +349,103 @@ async def on_message_monitor(message):
             'embeds': [e.to_dict() for e in message.embeds]
         }
         security_system.category_messages[channel_id_str].append(msg_data)
-        # Manter apenas as últimas 50 mensagens para evitar arquivos gigantes
         security_system.category_messages[channel_id_str] = security_system.category_messages[channel_id_str][-50:]
         await security_system.save_data()
 
+    # Cache de mensagens para detecção de ghostping
+    if not message.author.bot and message.mentions:
+        security_system.message_cache[message.id] = {
+            'author_id': message.author.id,
+            'author_name': str(message.author),
+            'content': message.content,
+            'mentions': [m.id for m in message.mentions if not m.bot],
+            'mention_names': [str(m) for m in message.mentions if not m.bot],
+            'channel_id': message.channel.id,
+            'guild_id': message.guild.id if message.guild else None,
+            'timestamp': message.created_at.isoformat()
+        }
+        # Manter cache com no máximo 2000 mensagens
+        if len(security_system.message_cache) > 2000:
+            oldest_key = next(iter(security_system.message_cache))
+            del security_system.message_cache[oldest_key]
+
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_message_delete(message):
+    """Detecta ghostping: alguém mencionou e deletou a mensagem"""
+    cached = security_system.message_cache.pop(message.id, None)
+    if not cached:
+        return
+
+    if not cached['mentions']:
+        return
+
+    if not cached.get('guild_id'):
+        return
+
+    sent_at = datetime.fromisoformat(cached['timestamp'])
+    age_seconds = (datetime.utcnow() - sent_at).total_seconds()
+    if age_seconds > 600:
+        return
+
+    # Usa bot.get_channel() em vez de message.guild (que pode ser None em mensagens parciais)
+    channel = bot.get_channel(cached['channel_id'])
+    if not channel:
+        return
+
+    guild = bot.get_guild(cached['guild_id'])
+    if not guild:
+        return
+
+    mentioned_str = ', '.join([f"<@{uid}>" for uid in cached['mentions']])
+    content_text = cached['content'][:900] if cached['content'] else 'Sem texto (so mencao)'
+
+    embed = discord.Embed(
+        title="Ghostping Detectado",
+        description=f"**{cached['author_name']}** mencionou alguem e deletou a mensagem.",
+        color=COLORS['warning'],
+        timestamp=datetime.utcnow()
+    )
+    embed.add_field(name="Autor", value=f"<@{cached['author_id']}>", inline=True)
+    embed.add_field(name="Mencionados", value=mentioned_str, inline=True)
+    embed.add_field(name="Deletado apos", value=f"{int(age_seconds)}s", inline=True)
+    embed.add_field(name="Conteudo original", value=f"```{content_text}```", inline=False)
+
+    try:
+        await channel.send(embed=embed)
+        print(f"[Ghostping] {cached['author_name']} pingou {mentioned_str} e deletou em {int(age_seconds)}s")
+    except Exception as e:
+        print(f"[Ghostping] Erro ao enviar embed: {e}")
+
+    # Registra flag de segurança
+    guild_id_str = str(guild.id)
+    author_id_str = str(cached['author_id'])
+    if guild_id_str not in security_system.security_flags:
+        security_system.security_flags[guild_id_str] = {}
+    if author_id_str not in security_system.security_flags[guild_id_str]:
+        security_system.security_flags[guild_id_str][author_id_str] = []
+    security_system.security_flags[guild_id_str][author_id_str].append({
+        'type': 'ghostping',
+        'timestamp': datetime.utcnow().isoformat(),
+        'detail': f"Ghostping em #{channel.name}"
+    })
+
+    # Log no canal de segurança
+    try:
+        await security_system.log_security_action(
+            guild,
+            "Ghostping Detectado",
+            f"<@{cached['author_id']}> fez ghostping em {channel.mention}",
+            COLORS['warning'],
+            [
+                {'name': 'Mencionados', 'value': mentioned_str, 'inline': True},
+                {'name': 'Deletado apos', 'value': f"{int(age_seconds)}s", 'inline': True}
+            ]
+        )
+    except Exception as e:
+        print(f"[Ghostping] Erro ao logar: {e}")
 
 @bot.event
 async def on_guild_channel_create(channel):
@@ -2891,6 +2985,7 @@ async def security_help(ctx):
         name="Utilidades",
         value=(
             "`!sec_info [@user]`\n"
+            "`!sec_perfil @user`\n"
             "`!sec_avatar [@user]`\n"
             "`!sec_servidor`\n"
             "`!sec_membros [status]`\n"
@@ -2932,6 +3027,290 @@ async def security_help(ctx):
     )
 
     await ctx.reply(embed=embed)
+
+@bot.command(name='perfil', aliases=['profile', 'p'])
+@is_owner()
+async def security_profile(ctx, user: discord.Member = None):
+    """Perfil de segurança completo de um usuário"""
+    if not user:
+        await ctx.reply("Mencione um usuário. Ex: `!sec_perfil @user`")
+        return
+
+    guild_id_str = str(ctx.guild.id)
+    user_id_str = str(user.id)
+    now = datetime.utcnow()
+    config = security_system.get_guild_config(ctx.guild.id)
+
+    account_age_days = (now - user.created_at.replace(tzinfo=None)).days
+    join_age_days = (now - user.joined_at.replace(tzinfo=None)).days if user.joined_at else 0
+
+    warnings_list = security_system.user_warnings.get(guild_id_str, {}).get(user_id_str, [])
+    warnings_count = len(warnings_list)
+
+    flags = security_system.security_flags.get(guild_id_str, {}).get(user_id_str, [])
+
+    ban_history = security_system.bot_ban_history.get(guild_id_str, {}).get(user_id_str, [])
+    ban_attempts = len(ban_history)
+
+    spam_data = security_system.spam_tracker.get(guild_id_str, {}).get(user_id_str, [])
+    spam_count = len(spam_data) if isinstance(spam_data, list) else 0
+
+    # Score de risco
+    risk_score = 0
+    risk_reasons = []
+    if account_age_days < 7:
+        risk_score += 3
+        risk_reasons.append("Conta com menos de 7 dias")
+    elif account_age_days < 30:
+        risk_score += 1
+        risk_reasons.append("Conta com menos de 30 dias")
+    if not user.avatar:
+        risk_score += 1
+        risk_reasons.append("Sem avatar personalizado")
+    if warnings_count > 0:
+        risk_score += warnings_count
+        risk_reasons.append(f"{warnings_count} aviso(s) registrado(s)")
+    if flags:
+        risk_score += len(flags)
+        risk_reasons.append(f"{len(flags)} flag(s) de segurança (ghostping, etc)")
+    if ban_attempts > 0:
+        risk_score += ban_attempts * 2
+        risk_reasons.append(f"{ban_attempts} tentativa(s) de ban suspeita(s) detectada(s)")
+    if spam_count > 0:
+        risk_score += 1
+        risk_reasons.append("Histórico de spam detectado")
+
+    if risk_score == 0:
+        risk_label = "BAIXO"
+        embed_color = COLORS['success']
+    elif risk_score <= 3:
+        risk_label = "MÉDIO"
+        embed_color = COLORS['warning']
+    else:
+        risk_label = "ALTO"
+        embed_color = COLORS['danger']
+
+    # Permissões perigosas
+    perm_checks = [
+        ('administrator', 'Administrator'),
+        ('ban_members', 'Ban Members'),
+        ('kick_members', 'Kick Members'),
+        ('manage_roles', 'Manage Roles'),
+        ('manage_channels', 'Manage Channels'),
+        ('manage_guild', 'Manage Server'),
+        ('manage_webhooks', 'Manage Webhooks'),
+        ('manage_messages', 'Manage Messages'),
+        ('mention_everyone', 'Mention Everyone'),
+        ('manage_nicknames', 'Manage Nicknames'),
+        ('deafen_members', 'Deafen Members'),
+        ('move_members', 'Move Members'),
+    ]
+    perms = user.guild_permissions
+    dangerous_perms = [label for attr, label in perm_checks if getattr(perms, attr, False)]
+
+    # Status e dispositivo
+    status_map = {
+        discord.Status.online: "Online",
+        discord.Status.idle: "Ausente",
+        discord.Status.dnd: "Não perturbe",
+        discord.Status.offline: "Offline"
+    }
+    current_status = status_map.get(user.status, "Desconhecido")
+
+    device = "Desconhecido"
+    if hasattr(user, 'mobile_status') and user.mobile_status != discord.Status.offline:
+        device = "Mobile"
+    elif hasattr(user, 'desktop_status') and user.desktop_status != discord.Status.offline:
+        device = "Desktop"
+    elif hasattr(user, 'web_status') and user.web_status != discord.Status.offline:
+        device = "Web"
+
+    # Atividade atual
+    activity_str = "Nenhuma"
+    if user.activities:
+        for act in user.activities:
+            if isinstance(act, discord.Game):
+                activity_str = f"Jogando {act.name}"
+                break
+            elif isinstance(act, discord.Streaming):
+                activity_str = f"Streaming: {act.name}"
+                break
+            elif isinstance(act, discord.Spotify):
+                activity_str = f"Ouvindo {act.title} - {act.artist}"
+                break
+            elif isinstance(act, discord.CustomActivity) and act.name:
+                activity_str = f"Status: {act.name[:50]}"
+                break
+
+    # Silenciamento ativo
+    timed_out = user.timed_out_until
+    timeout_str = "Nao"
+    if timed_out and timed_out.replace(tzinfo=None) > now:
+        remaining = timed_out.replace(tzinfo=None) - now
+        mins = int(remaining.total_seconds() // 60)
+        timeout_str = f"Sim — termina em {mins} min"
+
+    # Canal de voz
+    voice_str = "Nao"
+    if user.voice and user.voice.channel:
+        vc = user.voice.channel
+        voice_str = f"{vc.name} ({len(vc.members)} pessoa(s))"
+        if user.voice.self_mute:
+            voice_str += " [mutado]"
+        if user.voice.self_deaf:
+            voice_str += " [surdo]"
+
+    # Cargos
+    roles = [r for r in user.roles if r.name != "@everyone"]
+    roles_sorted = sorted(roles, key=lambda r: r.position, reverse=True)
+
+    # Boost
+    boost_str = user.premium_since.strftime('%d/%m/%Y') if user.premium_since else "Nao"
+
+    # Acoes recentes no audit log
+    recent_actions = []
+    try:
+        async for entry in ctx.guild.audit_logs(limit=50):
+            if entry.user and entry.user.id == user.id:
+                action_name = str(entry.action).replace('AuditLogAction.', '').replace('_', ' ')
+                ts = entry.created_at.strftime('%d/%m %H:%M')
+                target_name = getattr(entry.target, 'name', None) or getattr(entry.target, 'display_name', str(entry.target))
+                recent_actions.append(f"`{ts}` {action_name} → {target_name[:30]}")
+                if len(recent_actions) >= 5:
+                    break
+    except Exception:
+        pass
+
+    # ── Monta embed ──
+    embed = discord.Embed(
+        title=f"Perfil — {user.display_name} ({user.id})",
+        color=embed_color,
+        timestamp=now
+    )
+    if user.avatar:
+        embed.set_thumbnail(url=user.avatar.url)
+
+    # Coluna 1: Conta
+    embed.add_field(
+        name="Conta",
+        value="\n".join([
+            f"Tag: {str(user)}",
+            f"Criada em: {user.created_at.strftime('%d/%m/%Y')}",
+            f"Idade da conta: {account_age_days} dias",
+            f"Bot: {'Sim' if user.bot else 'Nao'}",
+            f"Avatar: {'Sim' if user.avatar else 'Nao'}",
+            f"Boost: {boost_str}",
+        ]),
+        inline=True
+    )
+
+    # Coluna 2: Servidor
+    whitelist_val = "Sim" if user.id in config.get('whitelist_users', []) else "Nao"
+    owner_val = "Sim" if user.id == OWNER_ID else "Nao"
+    embed.add_field(
+        name="Servidor",
+        value="\n".join([
+            f"Entrou em: {user.joined_at.strftime('%d/%m/%Y') if user.joined_at else 'Desconhecido'}",
+            f"Tempo: {join_age_days} dias",
+            f"Cargo mais alto: {user.top_role.name}",
+            f"Total de cargos: {len(roles_sorted)}",
+            f"Whitelist: {whitelist_val}",
+            f"Owner do bot: {owner_val}",
+        ]),
+        inline=True
+    )
+
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Coluna 3: Presença
+    embed.add_field(
+        name="Presenca",
+        value="\n".join([
+            f"Status: {current_status}",
+            f"Dispositivo: {device}",
+            f"Atividade: {activity_str}",
+            f"Em voz: {voice_str}",
+            f"Silenciado: {timeout_str}",
+        ]),
+        inline=True
+    )
+
+    # Coluna 4: Segurança
+    embed.add_field(
+        name="Seguranca",
+        value="\n".join([
+            f"Risco: {risk_label} (score {risk_score})",
+            f"Avisos: {warnings_count}",
+            f"Flags: {len(flags)}",
+            f"Tentativas de ban: {ban_attempts}",
+            f"Spam detectado: {'Sim' if spam_count > 0 else 'Nao'}",
+        ]),
+        inline=True
+    )
+
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+
+    # Permissões perigosas
+    embed.add_field(
+        name=f"Permissoes Perigosas ({len(dangerous_perms)})",
+        value=", ".join(dangerous_perms) if dangerous_perms else "Nenhuma",
+        inline=False
+    )
+
+    # Cargos
+    if roles_sorted:
+        roles_text = ", ".join([r.name for r in roles_sorted[:10]])
+        if len(roles_sorted) > 10:
+            roles_text += f" +{len(roles_sorted) - 10} mais"
+        embed.add_field(name=f"Cargos ({len(roles_sorted)})", value=roles_text, inline=False)
+
+    # Motivos do risco
+    if risk_reasons:
+        embed.add_field(
+            name="Motivos do Risco",
+            value="\n".join(f"- {r}" for r in risk_reasons),
+            inline=False
+        )
+
+    # Avisos registrados
+    if warnings_count > 0:
+        warn_lines = []
+        for w in warnings_list[-5:]:
+            ts = datetime.fromisoformat(w['timestamp']).strftime('%d/%m/%Y')
+            moderator = bot.get_user(w['moderator'])
+            mod_name = moderator.name if moderator else "Desconhecido"
+            warn_lines.append(f"`{ts}` por {mod_name} — {w['reason'][:60]}")
+        embed.add_field(
+            name=f"Avisos ({warnings_count} total)",
+            value="\n".join(warn_lines),
+            inline=False
+        )
+
+    # Flags de segurança
+    if flags:
+        flag_lines = []
+        for f in flags[-5:]:
+            ts = datetime.fromisoformat(f['timestamp']).strftime('%d/%m %H:%M')
+            flag_lines.append(f"`{ts}` [{f['type']}] {f['detail']}")
+        embed.add_field(
+            name=f"Flags de Seguranca ({len(flags)} total)",
+            value="\n".join(flag_lines),
+            inline=False
+        )
+
+    # Ações recentes no servidor (audit log)
+    if recent_actions:
+        embed.add_field(
+            name="Acoes Recentes no Servidor",
+            value="\n".join(recent_actions),
+            inline=False
+        )
+    else:
+        embed.add_field(name="Acoes Recentes no Servidor", value="Nenhuma encontrada", inline=False)
+
+    embed.set_footer(text=f"Consultado por {ctx.author.name}")
+    await ctx.reply(embed=embed)
+
 
 # Error handler
 @bot.event
