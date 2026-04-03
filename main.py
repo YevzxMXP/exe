@@ -332,60 +332,24 @@ async def on_ready():
     bot.loop.create_task(update_status())
 
 @bot.event
-async def on_message(message):
-    if message.author.id == bot.user.id:
-        return
-
-    # Monitorar mensagens na categoria específica
-    if message.channel.category_id == 1451797806259114080:
-        channel_id_str = str(message.channel.id)
-        if channel_id_str not in security_system.category_messages:
-            security_system.category_messages[channel_id_str] = []
-        
-        msg_data = {
-            'author': str(message.author),
-            'content': message.content,
-            'timestamp': message.created_at.isoformat(),
-            'embeds': [e.to_dict() for e in message.embeds]
-        }
-        security_system.category_messages[channel_id_str].append(msg_data)
-        security_system.category_messages[channel_id_str] = security_system.category_messages[channel_id_str][-50:]
-        await security_system.save_data()
-
-    # Cache de mensagens para detecção de ghostping
-    if not message.author.bot and message.mentions:
-        security_system.message_cache[message.id] = {
-            'author_id': message.author.id,
-            'author_name': str(message.author),
-            'content': message.content,
-            'mentions': [m.id for m in message.mentions if not m.bot],
-            'mention_names': [str(m) for m in message.mentions if not m.bot],
-            'channel_id': message.channel.id,
-            'guild_id': message.guild.id if message.guild else None,
-            'timestamp': message.created_at.isoformat()
-        }
-        # Manter cache com no máximo 2000 mensagens
-        if len(security_system.message_cache) > 2000:
-            oldest_key = next(iter(security_system.message_cache))
-            del security_system.message_cache[oldest_key]
-
-    await bot.process_commands(message)
-
-
-@bot.event
 async def on_message_delete(message):
     """Detecta ghostping: alguém mencionou e deletou a mensagem"""
     cached = security_system.message_cache.pop(message.id, None)
     if not cached:
         return
 
-    if not cached['mentions']:
+    has_any_mention = (
+        bool(cached.get('mentions')) or
+        cached.get('mention_everyone') or
+        bool(cached.get('mention_roles'))
+    )
+    if not has_any_mention:
         return
 
     if not cached.get('guild_id'):
         return
 
-    sent_at = datetime.fromisoformat(cached['timestamp'])
+    sent_at = datetime.fromisoformat(cached['timestamp']).replace(tzinfo=None)
     age_seconds = (datetime.utcnow() - sent_at).total_seconds()
     if age_seconds > 600:
         return
@@ -399,8 +363,16 @@ async def on_message_delete(message):
     if not guild:
         return
 
-    mentioned_str = ', '.join([f"<@{uid}>" for uid in cached['mentions']])
-    content_text = cached['content'][:900] if cached['content'] else 'Sem texto (so mencao)'
+    mention_parts = [f"<@{uid}>" for uid in cached.get('mentions', [])]
+    if cached.get('mention_everyone'):
+        mention_parts.append('@everyone/@here')
+    for rid in cached.get('mention_roles', []):
+        mention_parts.append(f"<@&{rid}>")
+    mentioned_str = ', '.join(mention_parts) if mention_parts else 'N/A'
+
+    # Usa conteudo do cache; fallback para o objeto message do discord.py
+    raw_content = cached.get('content') or getattr(message, 'content', '') or ''
+    content_text = raw_content[:900] if raw_content else 'Sem texto (so mencao)'
 
     embed = discord.Embed(
         title="Ghostping Detectado",
@@ -432,20 +404,6 @@ async def on_message_delete(message):
         'detail': f"Ghostping em #{channel.name}"
     })
 
-    # Log no canal de segurança
-    try:
-        await security_system.log_security_action(
-            guild,
-            "Ghostping Detectado",
-            f"<@{cached['author_id']}> fez ghostping em {channel.mention}",
-            COLORS['warning'],
-            [
-                {'name': 'Mencionados', 'value': mentioned_str, 'inline': True},
-                {'name': 'Deletado apos', 'value': f"{int(age_seconds)}s", 'inline': True}
-            ]
-        )
-    except Exception as e:
-        print(f"[Ghostping] Erro ao logar: {e}")
 
 @bot.event
 async def on_guild_channel_create(channel):
@@ -887,6 +845,45 @@ async def on_message(message):
     if not guild:
         await bot.process_commands(message)
         return
+
+    # Monitorar mensagens na categoria específica
+    if message.channel.category_id == 1451797806259114080:
+        channel_id_str = str(message.channel.id)
+        if channel_id_str not in security_system.category_messages:
+            security_system.category_messages[channel_id_str] = []
+        msg_data = {
+            'author': str(message.author),
+            'content': message.content,
+            'timestamp': message.created_at.isoformat(),
+            'embeds': [e.to_dict() for e in message.embeds]
+        }
+        security_system.category_messages[channel_id_str].append(msg_data)
+        security_system.category_messages[channel_id_str] = security_system.category_messages[channel_id_str][-50:]
+        await security_system.save_data()
+
+    # Cache de mensagens para detecção de ghostping
+    has_any_mention = (
+        bool(message.mentions) or
+        message.mention_everyone or
+        bool(message.role_mentions)
+    )
+    if not message.author.bot and has_any_mention:
+        security_system.message_cache[message.id] = {
+            'author_id': message.author.id,
+            'author_name': str(message.author),
+            'content': message.content,
+            'mentions': [m.id for m in message.mentions if not m.bot],
+            'mention_names': [str(m) for m in message.mentions if not m.bot],
+            'mention_everyone': message.mention_everyone,
+            'mention_roles': [r.id for r in message.role_mentions],
+            'mention_role_names': [r.name for r in message.role_mentions],
+            'channel_id': message.channel.id,
+            'guild_id': message.guild.id if message.guild else None,
+            'timestamp': message.created_at.isoformat()
+        }
+        if len(security_system.message_cache) > 2000:
+            oldest_key = next(iter(security_system.message_cache))
+            del security_system.message_cache[oldest_key]
 
     # APENAS help/h/ajuda, status_categoria, savecanais, limpar_historico, teste são comandos públicos/especiais
     public_commands = ['help', 'h', 'ajuda', 'status_categoria', 'savecanais', 'limpar_historico', 'teste']
