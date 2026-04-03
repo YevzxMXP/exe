@@ -292,6 +292,9 @@ class SecurityBot:
 # Instância global do sistema de segurança
 security_system = SecurityBot()
 
+# Sessões ativas de contagem de mensagens: {channel_id: {'counts': {user_id: {'name': str, 'count': int}}, 'active': bool}}
+contagem_sessions = {}
+
 @bot.event
 async def on_ready():
     """Evento executado quando o bot está pronto"""
@@ -1054,6 +1057,16 @@ async def on_message(message):
                 )
             except Exception as e:
                 print(f"❌ Erro ao deletar convite: {e}")
+
+    # Rastreia mensagens para sessoes de contagem ativas
+    channel_id = message.channel.id
+    if channel_id in contagem_sessions and contagem_sessions[channel_id]['active']:
+        if not message.author.bot:
+            session = contagem_sessions[channel_id]
+            uid = message.author.id
+            if uid not in session['counts']:
+                session['counts'][uid] = {'name': str(message.author.display_name), 'count': 0}
+            session['counts'][uid]['count'] += 1
 
     await bot.process_commands(message)
 
@@ -3307,6 +3320,221 @@ async def security_profile(ctx, user: discord.Member = None):
 
     embed.set_footer(text=f"Consultado por {ctx.author.name}")
     await ctx.reply(embed=embed)
+
+
+def _parse_duration(text: str):
+    """Converte string de duracao (ex: 30s, 5m, 1h) em segundos. Retorna None se invalido."""
+    text = text.strip().lower()
+    if text.endswith('s'):
+        try:
+            return int(text[:-1])
+        except ValueError:
+            return None
+    elif text.endswith('m'):
+        try:
+            return int(text[:-1]) * 60
+        except ValueError:
+            return None
+    elif text.endswith('h'):
+        try:
+            return int(text[:-1]) * 3600
+        except ValueError:
+            return None
+    return None
+
+
+@bot.command(name='contagem')
+async def contagem(ctx):
+    """Conta mensagens por usuario durante um periodo definido"""
+    channel_id = ctx.channel.id
+
+    if channel_id in contagem_sessions and contagem_sessions[channel_id]['active']:
+        await ctx.send("Ja existe uma contagem ativa neste canal. Aguarde ela terminar.")
+        return
+
+    await ctx.send("Quanto tempo de analise? Exemplos: 30s, 5m, 2h")
+
+    def check(m):
+        return m.author.id == ctx.author.id and m.channel.id == channel_id
+
+    try:
+        reply = await bot.wait_for('message', timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        await ctx.send("Tempo esgotado. Contagem cancelada.")
+        return
+
+    segundos = _parse_duration(reply.content)
+    if not segundos or segundos <= 0 or segundos > 86400:
+        await ctx.send("Duracao invalida. Use formatos como 30s, 5m, 1h (maximo 24h).")
+        return
+
+    if segundos < 60:
+        tempo_texto = f"{segundos}s"
+    elif segundos < 3600:
+        tempo_texto = f"{segundos // 60}m"
+    else:
+        tempo_texto = f"{segundos // 3600}h{(segundos % 3600) // 60}m" if segundos % 3600 else f"{segundos // 3600}h"
+
+    contagem_sessions[channel_id] = {'counts': {}, 'active': True}
+    await ctx.send(f"Contagem iniciada por {tempo_texto}. Monitorando mensagens...")
+
+    await asyncio.sleep(segundos)
+
+    session = contagem_sessions.pop(channel_id, None)
+    if not session:
+        return
+
+    counts = session['counts']
+    if not counts:
+        await ctx.send("Nenhuma mensagem registrada no periodo.")
+        return
+
+    sorted_counts = sorted(counts.values(), key=lambda x: x['count'], reverse=True)
+
+    linhas = [f"Resultado da contagem ({tempo_texto}):"]
+    linhas.append("-" * 30)
+    for i, entry in enumerate(sorted_counts, start=1):
+        linhas.append(f"{i}. {entry['name']} - {entry['count']} mensagem{'s' if entry['count'] != 1 else ''}")
+    linhas.append("-" * 30)
+    linhas.append(f"Total: {sum(e['count'] for e in sorted_counts)} mensagens de {len(sorted_counts)} usuario{'s' if len(sorted_counts) != 1 else ''}")
+
+    resultado = "\n".join(linhas)
+
+    # Divide em chunks de 1900 chars para evitar limite do Discord
+    for i in range(0, len(resultado), 1900):
+        await ctx.send(f"```\n{resultado[i:i+1900]}\n```")
+
+
+# Cargos monitorados para alerta de atribuição
+MONITORED_ROLE_IDS = {
+    1451797802731573282,
+    1469092098287599637,
+    1451797802731573283,
+    1451797802731573281,
+    1451797802702340105,
+    1458603369072562371,
+    1457926019229945936,
+    1451797802702340104,
+    1458603365964582914,
+    1451797802702340103,
+    1457926502682198223,
+    1451797802702340102,
+    1458603372180672594,
+    1451797802702340101,
+    1458603363964031088,
+    1451797802702340100,
+}
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Monitora atribuição de cargos específicos e alerta no canal de logs"""
+    added_roles = [r for r in after.roles if r not in before.roles and r.id in MONITORED_ROLE_IDS]
+    if not added_roles:
+        return
+
+    guild = after.guild
+    logs_channel = await security_system.get_logs_channel(guild)
+    if not logs_channel:
+        return
+
+    # Tenta descobrir quem adicionou o cargo via audit log
+    executor = None
+    await asyncio.sleep(1)
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+            if entry.target.id == after.id:
+                executor = entry.user
+                break
+    except Exception:
+        pass
+
+    for role in added_roles:
+        # Tempo no servidor do membro que recebeu o cargo
+        joined_at = after.joined_at
+        if joined_at:
+            delta = datetime.utcnow() - joined_at.replace(tzinfo=None)
+            days = delta.days
+            hours, remainder = divmod(delta.seconds, 3600)
+            minutes = remainder // 60
+            member_time = f"{days}d {hours}h {minutes}m"
+        else:
+            member_time = "Desconhecido"
+
+        embed = discord.Embed(
+            title="🏷️ Cargo Monitorado Atribuído",
+            description=f"O cargo {role.mention} foi adicionado a {after.mention}.",
+            color=role.color if role.color.value != 0 else COLORS['info'],
+            timestamp=datetime.utcnow()
+        )
+
+        embed.add_field(
+            name="👤 Membro que Recebeu",
+            value=f"{after.mention}\n`{after.name}` | ID: `{after.id}`",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🏷️ Cargo Adicionado",
+            value=f"{role.mention}\n`{role.name}` | ID: `{role.id}`",
+            inline=True
+        )
+
+        embed.add_field(
+            name="⏱️ Tempo de {0} no Servidor".format(after.display_name),
+            value=member_time,
+            inline=True
+        )
+
+        if executor:
+            # Tempo no servidor de quem adicionou
+            exec_joined = executor.joined_at if hasattr(executor, 'joined_at') else None
+            if exec_joined:
+                exec_delta = datetime.utcnow() - exec_joined.replace(tzinfo=None)
+                exec_days = exec_delta.days
+                exec_hours, exec_rem = divmod(exec_delta.seconds, 3600)
+                exec_minutes = exec_rem // 60
+                exec_time = f"{exec_days}d {exec_hours}h {exec_minutes}m"
+            else:
+                exec_time = "Desconhecido"
+
+            # Cargo mais alto de quem adicionou
+            exec_member = guild.get_member(executor.id)
+            if exec_member and exec_member.top_role:
+                top_role_val = f"{exec_member.top_role.mention}\n`{exec_member.top_role.name}`"
+            else:
+                top_role_val = "Desconhecido"
+
+            embed.add_field(
+                name="🛡️ Adicionado por",
+                value=f"{executor.mention}\n`{executor.name}` | ID: `{executor.id}`",
+                inline=True
+            )
+
+            embed.add_field(
+                name="👑 Cargo Mais Alto (Executor)",
+                value=top_role_val,
+                inline=True
+            )
+
+            embed.add_field(
+                name="⏱️ Tempo de {0} no Servidor".format(executor.display_name),
+                value=exec_time,
+                inline=True
+            )
+        else:
+            embed.add_field(
+                name="🛡️ Adicionado por",
+                value="Não foi possível identificar",
+                inline=True
+            )
+
+        embed.set_thumbnail(url=after.display_avatar.url)
+        embed.set_footer(text=f"Servidor: {guild.name} • Monitor de Cargos")
+
+        try:
+            await logs_channel.send(embed=embed)
+        except Exception as e:
+            print(f"❌ [MONITOR CARGO] Erro ao enviar log: {e}")
 
 
 # Error handler
