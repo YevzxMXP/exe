@@ -341,6 +341,11 @@ async def on_message_delete(message):
     if not cached:
         return
 
+    # Ignora ghostping de usuarios isentos
+    GHOSTPING_EXEMPT_IDS = {431544605209788416, 983196900910039090}
+    if cached.get('author_id') in GHOSTPING_EXEMPT_IDS:
+        return
+
     has_any_mention = (
         bool(cached.get('mentions')) or
         cached.get('mention_everyone') or
@@ -365,6 +370,17 @@ async def on_message_delete(message):
     guild = bot.get_guild(cached['guild_id'])
     if not guild:
         return
+
+    # Verifica se quem apagou a mensagem foi um bot — se sim, ignora
+    try:
+        await asyncio.sleep(0.5)
+        async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.message_delete):
+            if entry.target and entry.target.id == cached['author_id']:
+                if entry.user and entry.user.bot:
+                    return
+                break
+    except Exception:
+        pass
 
     mention_parts = [f"<@{uid}>" for uid in cached.get('mentions', [])]
     if cached.get('mention_everyone'):
